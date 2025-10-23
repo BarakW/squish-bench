@@ -1,8 +1,9 @@
 # SQUISH benchmark
 
 **SQUISH** (Summarization QUantifiable Information Saving Heuristic) is a **quantitative** benchmark for evaluating the ability of LLMs to compress information from documents into summaries.
+
 ## Overview
-SQUISH adopts the perspective that an LLM can be thought of as a lossy decompression program, that generates some output given a prompt. Using this perspective, you can model a summary as a semantically encoded version of the original text. The goal of an optimal summary is to maximize the amount of information transferred to the original document, while being smaller than the original document (to subvert the trivial case of a document being its own summary).
+SQUISH adopts the perspective that an LLM can be thought of as a lossy decompression program, that generates some output given a prompt. Using this perspective, you can model a summary as a semantically encoded version of the original text. The goal of an optimal summary is to maximize the amount of information transferred to the original document, while being smaller than the original document.
 
 This can be explicitly measured by using a reference base model LLM with the following high level steps:
 1. Generate summaries for a document with some max summary size
@@ -15,6 +16,9 @@ This can be explicitly measured by using a reference base model LLM with the fol
 This method can be used on arbitrary text, obviating the need for hyper-curated datasets.
 
 In addition to the benchmarking code, there is also a script included to RL a small model on this task using GRPO (-ish... it's all just policy gradient after all).
+
+The most relevant previous work is in [Shannon Score (2021)](https://arxiv.org/pdf/2103.10918). The primary difference between SQUISH and Shannon Score is that SQUISH includes a requirement for summaries to be smaller than the original document, which allows for RL to improve summary quality without encouraging the trivial case of the document being its own summary.
+
 ## Results
 You can run this benchmark at multiple different ratios of summary size, which is the primary parameter of interest in the SQUISH benchmark.
 
