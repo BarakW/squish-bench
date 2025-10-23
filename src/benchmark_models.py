@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections import defaultdict
 import asyncio
+from collections import defaultdict
 import hashlib
 import statistics
 from dataclasses import dataclass
@@ -10,6 +10,7 @@ from typing import Any, Iterator, Literal, cast
 from typing_extensions import Annotated
 
 import httpx
+import matplotlib.pyplot as plt
 import torch
 from datasets import Dataset, load_from_disk
 from pydantic import BaseModel, Field, BeforeValidator
@@ -62,15 +63,15 @@ MODEL_SPECS: list[ModelSpec] = [
     ModelSpec("GPT-4.1 Nano (Instruct)", model_id="openai/gpt-4.1-nano"),
     ModelSpec("GPT-3.5 Turbo (Instruct)", model_id="openai/gpt-3.5-turbo"),
     # Anthropic
-    # ModelSpec("Claude 4.5 Sonnet (Reasoning)", model_id="anthropic/claude-sonnet-4.5", unique_key="reasoning", reasoning="medium"),
-    # ModelSpec("Claude 4.5 Sonnet (Instruct)", model_id="anthropic/claude-sonnet-4.5", unique_key="instruct"),
-    # ModelSpec("Claude 4.5 Haiku (Reasoning)", model_id="anthropic/claude-haiku-4.5", unique_key="reasoning", reasoning="medium"),
-    # ModelSpec("Claude 4.5 Haiku (Instruct)", model_id="anthropic/claude-haiku-4.5", unique_key="instruct"),
-    # ModelSpec("Claude 4 Sonnet (Reasoning)", model_id="anthropic/claude-sonnet-4", unique_key="reasoning", reasoning="medium"),
-    # ModelSpec("Claude 4 Sonnet (Instruct)", model_id="anthropic/claude-sonnet-4", unique_key="instruct"),
-    # ModelSpec("Claude 3.7 Sonnet (Reasoning)", model_id="anthropic/claude-3-7-sonnet:thinking"),
-    # ModelSpec("Claude 3.7 Sonnet (Instruct)", model_id="anthropic/claude-3-7-sonnet"),
-    # ModelSpec("Claude 3 Haiku (Instruct)", model_id="anthropic/claude-3-haiku"),
+    ModelSpec("Claude 4.5 Sonnet (Reasoning)", model_id="anthropic/claude-sonnet-4.5", unique_key="reasoning", reasoning="medium"),
+    ModelSpec("Claude 4.5 Sonnet (Instruct)", model_id="anthropic/claude-sonnet-4.5", unique_key="instruct"),
+    ModelSpec("Claude 4.5 Haiku (Reasoning)", model_id="anthropic/claude-haiku-4.5", unique_key="reasoning", reasoning="medium"),
+    ModelSpec("Claude 4.5 Haiku (Instruct)", model_id="anthropic/claude-haiku-4.5", unique_key="instruct"),
+    ModelSpec("Claude 4 Sonnet (Reasoning)", model_id="anthropic/claude-sonnet-4", unique_key="reasoning", reasoning="medium"),
+    ModelSpec("Claude 4 Sonnet (Instruct)", model_id="anthropic/claude-sonnet-4", unique_key="instruct"),
+    ModelSpec("Claude 3.7 Sonnet (Reasoning)", model_id="anthropic/claude-3-7-sonnet:thinking"),
+    ModelSpec("Claude 3.7 Sonnet (Instruct)", model_id="anthropic/claude-3-7-sonnet"),
+    ModelSpec("Claude 3 Haiku (Instruct)", model_id="anthropic/claude-3-haiku"),
     # Gemini
     ModelSpec("Gemini 2.5 Pro (Reasoning)", "google/gemini-2.5-pro", reasoning="medium"),
     ModelSpec(
@@ -322,6 +323,7 @@ def aggregate_results(config: BenchmarkConfig) -> None:
                 spec_id_to_rewards[spec.spec_id][document.id].append(record.reward)
 
     spec_id_to_reward_and_coverage: dict[str, tuple[float, float]] = dict()
+    spec_id_to_display_name = {spec.spec_id: spec.display_name for spec in MODEL_SPECS + [TRUNCATED_DOC_SPEC]}
 
     # Apply statistics
     for spec in MODEL_SPECS + [TRUNCATED_DOC_SPEC]:
@@ -369,6 +371,38 @@ def aggregate_results(config: BenchmarkConfig) -> None:
             print(
                 f"- ({spec_id}): mean_reward={spec_id_to_reward_and_coverage[spec_id][0]:.4f} over {spec_id_to_reward_and_coverage[spec_id][1]}/{config.limit} documents"
             )
+
+    # Plot results
+    plot_spec_ids = [
+        spec_id for spec_id in spec_ids_sorted_by_reward if spec_id != TRUNCATED_DOC_SPEC.spec_id and spec_id in spec_ids_at_high_coverage
+    ]
+    if not plot_spec_ids:
+        print("\nNo non-baseline models met the pass-rate threshold for plotting.")
+        return
+
+    plot_labels = [spec_id_to_display_name[spec_id] for spec_id in plot_spec_ids]
+    plot_rewards = [spec_id_to_reward_and_coverage[spec_id][0] for spec_id in plot_spec_ids]
+
+    height = 0.3 * len(plot_spec_ids)
+    fig, ax = plt.subplots(figsize=(10, height))
+    bars = ax.barh(plot_labels, plot_rewards, color="#4c78a8")
+    ax.margins(x=0.1, y=0.01)
+    ax.invert_yaxis()  # best model appears at the top
+    ax.set_xlabel("Mean reward")
+    ax.set_title("Aggregate Model Performance (higher is better)")
+
+    ax.bar_label(
+        bars,
+        labels=[f"{reward:.3f}" for reward in plot_rewards],
+        padding=3,
+        fontsize=8,
+    )
+
+    plt.tight_layout()
+    plot_path = config.cache_dir / "aggregate_results.png"
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 async def summarization_worker(
