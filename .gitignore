@@ -1,0 +1,9 @@
+.venv
+.env
+
+**/__pycache__/
+
+wandb
+cache*
+models
+datasets

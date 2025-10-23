@@ -1,0 +1,39 @@
+[project]
+name = "squish-bench"
+version = "0.0.1"
+description = "SQUISH Bench measures the quality of summaries"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "accelerate>=1.9.0",
+    "datasets>=4.0.0",
+    "flash-attn>=2.8.3",
+    "httpx>=0.28.1",
+    "ipykernel>=6.30.0",
+    "nest-asyncio>=1.6.0",
+    "peft>=0.16.0",
+    "polars>=1.31.0",
+    "pydantic>=2.11.7",
+    "pydantic-settings>=2.10.1",
+    "regex>=2024.11.6",
+    "torch>=2.8.0",
+    "transformers>=4.53.3",
+    "wandb>=0.22.1",
+]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["setuptools", "torch"]
+
+[tool.pyright]
+reportUnusedCallResult = false
+typeCheckingMode = "standard"
+
+[tool.ruff]
+line-length = 140
+ignore = ["F722", "F821"]
+
+[dependency-groups]
+dev = ["ruff>=0.14.0"]
