@@ -20,9 +20,15 @@ In addition to the benchmarking code, there is also a script included to RL a sm
 The most relevant previous work is in [Shannon Score (2021)](https://arxiv.org/pdf/2103.10918). The primary difference between SQUISH and Shannon Score is that SQUISH includes a requirement for summaries to be smaller than the original document, which allows for RL to improve summary quality without encouraging the trivial case of the document being its own summary.
 
 ## Results
-You can run this benchmark at multiple different ratios of summary size, which is the primary parameter of interest in the SQUISH benchmark.
+You can run this benchmark at multiple different ratios of summary size, which is the primary parameter of interest in the SQUISH benchmark. The N in `@N%` refers to the percentage of the original document's length that the summary is constrained to.
 
-**Coming Soon!**
+### SQUISH@5%
+![SQUISH@5%](results/medium_results.png)
+
+### SQUISH@10%
+![SQUISH@10%](results/large_results.png)
+
+** More summary sizes coming soon!** (it takes time and a solid chunk of compute resources to run the benchmark)
 ## How to reproduce results
 
 The easiest way to use this repo is with `uv`. Install it using [UV's documentation](https://docs.astral.sh/uv/getting-started/installation/)
