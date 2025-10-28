@@ -28,7 +28,7 @@ You can run this benchmark at multiple different ratios of summary size, which i
 ### SQUISH@10%
 ![SQUISH@10%](results/large_results.png)
 
-** More summary sizes coming soon!** (it takes time and a solid chunk of compute resources to run the benchmark)
+**More summary sizes coming soon!** (it takes time and a solid chunk of compute resources to run the benchmark)
 ## How to reproduce results
 
 The easiest way to use this repo is with `uv`. Install it using [UV's documentation](https://docs.astral.sh/uv/getting-started/installation/)

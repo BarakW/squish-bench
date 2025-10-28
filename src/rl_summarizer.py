@@ -1,17 +1,19 @@
 import os
 
+from pydantic_settings import BaseSettings, CliApp
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
 import logging
 from typing import cast
 
 import torch
-from datasets import IterableDataset, load_dataset
+from datasets import DatasetDict, load_from_disk
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from pydantic import BaseModel, Field, model_validator
+from pydantic import Field, model_validator
 from torch import Tensor
 from torch.nn import functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer, Qwen2Tokenizer, Qwen3ForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer, Qwen3ForCausalLM
 from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 from transformers.tokenization_utils_base import BatchEncoding
 
@@ -37,21 +39,21 @@ elif torch.mps.is_available():
     DEVICE = "mps"
 
 
-class TrainingConfig(BaseModel):
-    base_model_name: str
+class TrainingConfig(BaseSettings, cli_parse_args=True, cli_kebab_case=True):
+    base_model_name: str = "Qwen/Qwen3-1.7B-Base"
     trained_model_dir: str
-    max_document_length: int
+    max_document_length: int = 4096
     num_epochs: int = 1
-    batch_full_size: int
-    batch_micro_size: int
-    group_full_size: int
-    group_micro_size: int
-    policy_steps_per_group: int
-    learning_rate: float
-    epsilon_low: float
-    epsilon_high: float
+    batch_full_size: int = 32
+    batch_micro_size: int = 1
+    group_full_size: int = 32
+    group_micro_size: int = 1
+    policy_steps_per_group: int = 4
+    learning_rate: float = 1e-5
+    epsilon_low: float = 0.2
+    epsilon_high: float = 0.3
 
-    logging: bool = Field(exclude=True)
+    logging: bool = Field(default=False, exclude=True)
 
     @model_validator(mode="after")
     def validate_batch_and_group_sizes(self) -> "TrainingConfig":
@@ -70,8 +72,8 @@ class TrainingConfig(BaseModel):
         return self.group_full_size // self.group_micro_size
 
 
-def setup_model_and_tokenizer(config: TrainingConfig) -> tuple[Qwen2Tokenizer, Qwen3ForCausalLM]:
-    tokenizer = AutoTokenizer.from_pretrained(config.base_model_name, padding_side="left")
+def setup_model_and_tokenizer(config: TrainingConfig) -> tuple[PreTrainedTokenizer, Qwen3ForCausalLM]:
+    tokenizer = AutoTokenizer.from_pretrained(config.base_model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -84,9 +86,9 @@ def setup_model_and_tokenizer(config: TrainingConfig) -> tuple[Qwen2Tokenizer, Q
     )
     base_model.gradient_checkpointing_enable({"use_reentrant": False})
 
-    if os.path.exists(config.trained_model_dir):
+    if os.path.exists(f"models/{config.trained_model_dir}"):
         logger.info(f"Loading trained model from {config.trained_model_dir}")
-        model = PeftModel.from_pretrained(base_model, config.trained_model_dir, is_trainable=True)
+        model = PeftModel.from_pretrained(base_model, f"models/{config.trained_model_dir}", is_trainable=True)
     else:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -98,7 +100,7 @@ def setup_model_and_tokenizer(config: TrainingConfig) -> tuple[Qwen2Tokenizer, Q
         model = get_peft_model(base_model, peft_config)
 
     model.gradient_checkpointing_enable({"use_reentrant": False})
-    model = torch.compile(model)
+    model.forward = torch.compile(model.forward, dynamic=True)
     return tokenizer, model  # type: ignore[reportReturnType]
 
 
@@ -183,7 +185,7 @@ def get_advantage(rewards: Tensor) -> Tensor:
     return rewards - mean_reward
 
 
-@torch.compile()
+@torch.compile(dynamic=True)
 def get_model_log_probs(
     model: PreTrainedModel,
     input_ids_BT: Tensor,
@@ -238,7 +240,7 @@ def total_cross_entropy(
 
 def total_cross_entropy_from_base_model(
     model: Qwen3ForCausalLM,
-    tokenizer: Qwen2Tokenizer,
+    tokenizer: PreTrainedTokenizer,
     input_ids_BT: Tensor,
     /,
     micro_batch_size: int,
@@ -251,7 +253,7 @@ def total_cross_entropy_from_base_model(
 
 
 class StopOnSubsequence(LogitsProcessor):
-    def __init__(self, tokenizer: Qwen2Tokenizer, stop_strings: list[str], device: torch.device):
+    def __init__(self, tokenizer: PreTrainedTokenizer, stop_strings: list[str], device: torch.device):
         self.eos_token_id = cast(int, tokenizer.eos_token_id)
         self.stop_sequences: list[Tensor] = []
         for s in stop_strings:
@@ -274,8 +276,7 @@ class StopOnSubsequence(LogitsProcessor):
         return scores_BTD
 
 
-@torch.compile()
-def generate_outputs(model: Qwen3ForCausalLM, tokenizer: Qwen2Tokenizer, inputs: BatchEncoding, group_size: int) -> Tensor:
+def generate_outputs(model: Qwen3ForCausalLM, tokenizer: PreTrainedTokenizer, inputs: BatchEncoding, config: TrainingConfig) -> Tensor:
     logits_processor = LogitsProcessorList(
         [StopOnSubsequence(tokenizer, stop_strings=["</summary>", tokenizer.eos_token], device=model.device)]
     )
@@ -283,11 +284,10 @@ def generate_outputs(model: Qwen3ForCausalLM, tokenizer: Qwen2Tokenizer, inputs:
         batch_completions_BT = model.generate(
             do_sample=True,
             temperature=1.0,
-            num_return_sequences=group_size,
+            num_return_sequences=config.group_full_size,
             logits_processor=logits_processor,
-            max_new_tokens=300,
+            max_new_tokens=512,
             pad_token_id=tokenizer.pad_token_id,
-            cache_implementation="static",
             **inputs,  # type: ignore
         )
 
@@ -295,7 +295,7 @@ def generate_outputs(model: Qwen3ForCausalLM, tokenizer: Qwen2Tokenizer, inputs:
 
 
 def get_policy_log_probs(
-    model: Qwen3ForCausalLM, tokenizer: Qwen2Tokenizer, completions_BGT: Tensor, micro_batch_size: int, forward_only: bool
+    model: Qwen3ForCausalLM, tokenizer: PreTrainedTokenizer, completions_BGT: Tensor, micro_batch_size: int, forward_only: bool
 ) -> Tensor:
     B, G, T = completions_BGT.shape
     completions_BT = completions_BGT.reshape(-1, T)
@@ -327,34 +327,19 @@ def move_optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.dev
                 state[k] = v.to(device)
 
 
-SUMMARY_BUDGET_CHOICES = torch.tensor([budget.value for budget in SummaryBudgetChars], device=DEVICE)
-
-CONFIG = TrainingConfig(
-    base_model_name="Qwen/Qwen3-1.7B-Base",
-    trained_model_dir="rl_summarizer_1.7B_3",
-    max_document_length=1024,
-    batch_full_size=8,
-    batch_micro_size=2,
-    group_full_size=32,
-    group_micro_size=1,
-    policy_steps_per_group=4,
-    learning_rate=1e-5,
-    epsilon_low=0.2,
-    epsilon_high=0.3,
-    logging=False,
-)
-
-
 def main():
     """Main training function."""
+    SUMMARY_BUDGET_CHOICES = torch.tensor([budget.value for budget in SummaryBudgetChars], device=DEVICE)
+    CONFIG = CliApp.run(TrainingConfig)
+
     tokenizer, policy_model = setup_model_and_tokenizer(CONFIG)
 
-    dataset = cast(IterableDataset, load_dataset("allenai/c4", "realnewslike", streaming=True)["train"])
-    dataset_iter = dataset.batch(CONFIG.batch_full_size, drop_last_batch=True)
+    dataset = cast(DatasetDict, load_from_disk("datasets/c4_realnewslike_8k"))["train"]
+    dataset_iter = dataset.batch(CONFIG.batch_full_size, num_proc=4, drop_last_batch=True)
 
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=CONFIG.learning_rate, fused=True)
-    if os.path.exists(f"{CONFIG.trained_model_dir}/optimizer.pt"):
-        optimizer_state = torch.load(f"{CONFIG.trained_model_dir}/optimizer.pt")
+    if os.path.exists(f"models/{CONFIG.trained_model_dir}/optimizer.pt"):
+        optimizer_state = torch.load(f"models/{CONFIG.trained_model_dir}/optimizer.pt")
         optimizer.load_state_dict(optimizer_state)
     move_optimizer_to_cpu(optimizer)
 
@@ -397,12 +382,12 @@ def main():
                     + format_context_for_training(cast(str, doc), cast(int, budget.item()), is_base_model=True)
                     for doc, budget in zip(batch_accum_documents, summary_budgets_B)
                 ]
-                batch_accum_tokens = tokenizer(batch_accum_contexts, padding=True, return_tensors="pt").to(DEVICE)
+                batch_accum_tokens = tokenizer(batch_accum_contexts, padding=True, padding_side="left", return_tensors="pt").to(DEVICE)
 
                 input_ids_BT = batch_accum_tokens.input_ids
                 attn_mask_BT = batch_accum_tokens.attention_mask
 
-                batch_accum_completions_flat = generate_outputs(policy_model, tokenizer, batch_accum_tokens, G)
+                batch_accum_completions_flat = generate_outputs(policy_model, tokenizer, batch_accum_tokens, CONFIG)
                 generations_accum = tokenizer.batch_decode(batch_accum_completions_flat)
                 batch_accum_completions_BGT = batch_accum_completions_flat.reshape(B, G, -1)
 
@@ -458,8 +443,8 @@ def main():
             if reward_mean.item() > max_reward_mean:
                 max_reward_mean = reward_mean.item()
                 logger.info(f"New max reward mean {reward_mean.item()}, saving model")
-                policy_model.save_pretrained(CONFIG.trained_model_dir)
-                torch.save(optimizer.state_dict(), f"{CONFIG.trained_model_dir}/optimizer.pt")
+                policy_model.save_pretrained(f"models/{CONFIG.trained_model_dir}")
+                torch.save(optimizer.state_dict(), f"models/{CONFIG.trained_model_dir}/optimizer.pt")
 
             for step in range(CONFIG.policy_steps_per_group):
                 for batch_accum_step in range(CONFIG.batch_accum_steps):
