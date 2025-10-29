@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import os
+from dataclasses import dataclass
 
 from pydantic_settings import BaseSettings, CliApp
 
@@ -8,18 +11,19 @@ import logging
 from typing import cast
 
 import torch
-from datasets import DatasetDict, load_from_disk
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from pydantic import Field, model_validator
 from torch import Tensor
 from torch.nn import functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer, Qwen3ForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, Qwen3ForCausalLM
 from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 from transformers.tokenization_utils_base import BatchEncoding
 
 import wandb
-from data import format_context_for_training, get_attn_mask_from_tokens, get_context_for_evaluation, get_summary_from_generation
-from policy import Rollouts, SummaryBudget
+from data import format_context_for_training, get_summary_from_generation
+from datasets import DatasetDict, load_from_disk
+from evaluation import SummaryBudget, evaluate_summaries, get_model_log_probs, total_cross_entropy
+from utils import get_attn_mask_from_tokens
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
@@ -77,6 +81,23 @@ class TrainingConfig(BaseSettings, cli_parse_args=True, cli_kebab_case=True):
         return self.group_full_size // self.group_gen_size
 
 
+@dataclass
+class Rollouts:
+    tokens_BGT: Tensor  # Int32
+    generation_mask_BGT: Tensor  # Int8
+    old_policy_log_probs_BGT: Tensor  # Float
+    summary_budgets_B: Tensor  # Int32
+    # TODO: add advantages as a field for logical consolidation
+
+    def get_group_slice(self, group_idx: int, group_size: int) -> Rollouts:
+        return Rollouts(
+            tokens_BGT=self.tokens_BGT[:, group_idx : group_idx + group_size, :],
+            generation_mask_BGT=self.generation_mask_BGT[:, group_idx : group_idx + group_size, :],
+            old_policy_log_probs_BGT=self.old_policy_log_probs_BGT[:, group_idx : group_idx + group_size, :],
+            summary_budgets_B=self.summary_budgets_B,
+        )
+
+
 def setup_model_and_tokenizer(config: TrainingConfig) -> tuple[PreTrainedTokenizer, Qwen3ForCausalLM]:
     tokenizer = AutoTokenizer.from_pretrained(config.base_model_name)
     if tokenizer.pad_token is None:
@@ -109,139 +130,9 @@ def setup_model_and_tokenizer(config: TrainingConfig) -> tuple[PreTrainedTokeniz
     return tokenizer, model  # type: ignore[reportReturnType]
 
 
-@torch.inference_mode()
-def evaluate_summaries(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    document: str,
-    summaries: list[str | None],
-    /,
-    summary_budget: SummaryBudget,
-    micro_batch_size: int,
-    is_training: bool,
-) -> Tensor:
-    """
-    Uses a reference model to evaluate the information within the target documents.
-
-    Step 1: Get the cross-entropy of the document alone
-    Step 2: Get the cross-entropy of the document when it is prefixed by the summary
-    Step 3: Get the information saved by using the summary
-    Step 4: Return the information saved by the summary, conditional on meeting the summary budget
-
-    The return value represents the total
-    """
-    # Handle all empty summaries, to both save compute time and avoid edge cases
-    if all(not summary for summary in summaries):
-        return torch.zeros(len(summaries), device=model.device)
-
-    # failing to generate the summary format gets 0 reward
-    # Compute rewards only for non-empty summaries, set reward to 0 for empty summaries
-    populated_summaries: list[str] = []
-    nonempty_indices: list[int] = []
-    for i, summary in enumerate(summaries):
-        if summary:
-            populated_summaries.append(summary)
-            nonempty_indices.append(i)
-    populated_summary_lens = torch.tensor([len(summary) for summary in populated_summaries], device=DEVICE)
-
-    eval_context = get_context_for_evaluation(tokenizer, populated_summaries, document)
-
-    # Get the cross-entropy of the document alone
-    # TODO: cache these as they never change throughout training
-    document_tokens = eval_context.document_tokens[None, :].to(device=DEVICE)
-    document_loss = total_cross_entropy(model, tokenizer, document_tokens, micro_batch_size=micro_batch_size)
-
-    # Get the cross-entropy of the document when prefixed by the summary
-    document_with_summary_loss = total_cross_entropy(
-        model,
-        tokenizer,
-        eval_context.summaries_and_document_tokens.to(device=DEVICE),
-        micro_batch_size=micro_batch_size,
-        mask_to_zero_BT=eval_context.document_masks.to(device=DEVICE),
-    )
-
-    # Get the information saved by using the summary
-    information_saved = document_loss - document_with_summary_loss
-
-    budget_chars = int(summary_budget * len(document))
-    rewards_nonempty = information_saved.where(populated_summary_lens <= budget_chars, 0)
-    rewards_nonempty /= document_loss  # normalize reward by document information
-
-    # Create a reward tensor for all summaries, setting (mean - (max - mean)) for empty ones
-    max_reward = rewards_nonempty.max()
-    min_reward = rewards_nonempty.min()
-    reward_diff = max_reward - min_reward
-
-    # require at least (min - 0.1) for empty summaries, otherwise if all rewards are the same, empty summaries get too high a reward
-    reward_diff = max(reward_diff, 1e-1)
-
-    reward_empty_value = 0
-    if is_training:  # We want to discourage format non-adherance during training
-        reward_empty_value = min_reward - reward_diff
-
-    rewards = torch.empty(len(summaries), device=rewards_nonempty.device).fill_(reward_empty_value)
-    if len(nonempty_indices) > 0:
-        rewards[torch.tensor(nonempty_indices, device=rewards.device)] = rewards_nonempty
-
-    return rewards.to(device=model.device)
-
-
 def get_advantage(rewards: Tensor) -> Tensor:
     mean_reward = rewards.mean()
     return rewards - mean_reward
-
-
-@torch.compile(dynamic=True)
-def get_model_log_probs(
-    model: PreTrainedModel,
-    input_ids_BT: Tensor,
-    target_ids_BT: Tensor,
-    attention_mask_BT: Tensor,
-    forward_only: bool,
-) -> Tensor:
-    # We don't want the completions to be retained in the computation graph when computing the old policy
-    with torch.autocast(DEVICE, dtype=torch.bfloat16), torch.inference_mode(forward_only):
-        outputs = model.forward(input_ids=input_ids_BT, attention_mask=attention_mask_BT, use_cache=False)
-        assert outputs.logits is not None
-        log_probs_BTV = F.log_softmax(outputs.logits, dim=-1, dtype=torch.float32).to(model.device)
-        target_ids_BT = target_ids_BT.clone()  # There's a weird pytorch compile bug where the unsqueeze below fails if we don't clone first
-        log_probs_BT = log_probs_BTV.gather(dim=-1, index=target_ids_BT.unsqueeze(-1)).squeeze(-1)
-        return log_probs_BT
-
-
-def total_cross_entropy(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    input_ids_BT: Tensor,
-    /,
-    micro_batch_size: int,
-    mask_to_zero_BT: Tensor | None = None,
-) -> Tensor:
-    """Compute per-example summed cross-entropy over causal next-token predictions.
-
-    - Shifts targets by 1 position as usual for causal LM.
-    - If `mask_to_zero` is provided (True = masked), zeros those token losses
-      after the shift alignment (i.e., `mask_to_zero[:, :-1]`).
-    """
-    # Micro-batch the forward pass to reduce memory, matching get_policy_log_probs
-    per_example_losses: list[Tensor] = []
-    batch_size = input_ids_BT.size(0)
-
-    for i in range(0, batch_size, micro_batch_size):
-        micro_input = input_ids_BT[i : i + micro_batch_size]
-        micro_mask_to_zero = None if mask_to_zero_BT is None else mask_to_zero_BT[i : i + micro_batch_size]
-
-        attn_mask = get_attn_mask_from_tokens(micro_input, tokenizer.pad_token_id)
-        input_ids = micro_input[:, :-1]
-        target_ids = micro_input[:, 1:]
-        losses_BT = -get_model_log_probs(model, input_ids, target_ids, attn_mask, forward_only=True)
-
-        if micro_mask_to_zero is not None:
-            losses_BT[micro_mask_to_zero[:, :-1]] = 0.0
-
-        per_example_losses.append(losses_BT.sum(dim=1))
-
-    return torch.cat(per_example_losses, dim=0)
 
 
 def total_cross_entropy_from_base_model(

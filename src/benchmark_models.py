@@ -1,26 +1,26 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 import hashlib
 import statistics
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, cast
-from typing_extensions import Annotated
 
 import httpx
 import matplotlib.pyplot as plt
 import torch
-from datasets import Dataset, load_from_disk
-from pydantic import BaseModel, Field, BeforeValidator
+from pydantic import BaseModel, BeforeValidator, Field
 from pydantic_settings import BaseSettings, CliApp
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
+from typing_extensions import Annotated
 
 from client import client_config
 from data import format_context_for_training, get_summary_from_generation
+from datasets import Dataset, load_from_disk
+from evaluation import SummaryBudget
 from persistent_kv_store import PersistentKVStore
-from policy import SummaryBudget
 from process_dataset import DATASET_PATH
 from rl_summarizer import evaluate_summaries
 
@@ -227,8 +227,7 @@ async def generate_summary(
     if spec.reasoning is not None:
         extra_args["reasoning"] = {"effort": spec.reasoning}
 
-    budget_chars = int(len(document.text) * summary_budget.value)
-    prompt = format_context_for_training(document.text, budget_chars, is_base_model=False)
+    prompt = format_context_for_training(document.text, summary_budget, is_base_model=False)
     backoff = 1.0
     for attempt in range(max_retries):
         try:

@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import cast
 
-from datasets import load_dataset, DatasetDict
+from datasets import DatasetDict, load_dataset
 
 MIN_CHARS = 8_000
 HF_DATASET = "allenai/c4"
