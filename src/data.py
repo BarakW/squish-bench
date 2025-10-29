@@ -6,17 +6,21 @@ import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizer
 
+from policy import SummaryBudget
+
 
 class SummarizationData(TypedDict):
     text: str
     summary: str
 
 
-def format_context_for_training(document: str, num_chars: int, is_base_model: bool) -> str:
+def format_context_for_training(document: str, budget: SummaryBudget, is_base_model: bool) -> str:
+    budget_chars = int(len(document) * budget)
     maybe_prefill = "\n<summary>" if is_base_model else ""
-    return f"""Generate a summary of the provided document in strictly fewer than {num_chars} characters. Target a length of around {int(num_chars * 0.9)} characters. The document is within a <document> tag and the summary is within a <summary> tag.
+    res = f"""Generate a summary of the provided document in strictly fewer than {budget_chars} characters. Target a length of around {int(budget_chars * 0.9)} characters. The document is within a <document> tag and the summary is within a <summary> tag.
 
 <document>{document}</document>{maybe_prefill}"""
+    return res
 
 
 @dataclass

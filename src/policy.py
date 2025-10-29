@@ -7,17 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-class SummaryBudgetChars(int, Enum):
-    """Summary budget is measured in number of characters"""
-
-    EXTRA_SMALL = 64
-    SMALL = 128
-    MEDIUM = 256
-    LARGE = 512
-    EXTRA_LARGE = 1024
-
-
-class SummaryBudgetRatio(float, Enum):
+class SummaryBudget(float, Enum):
     """Summary budget is measured as a ratio of the document length"""
 
     EXTRA_SMALL = 0.01
@@ -26,8 +16,9 @@ class SummaryBudgetRatio(float, Enum):
     LARGE = 0.1
     EXTRA_LARGE = 0.2
 
-
-SummaryBudget = SummaryBudgetChars | SummaryBudgetRatio
+    @classmethod
+    def from_float(cls, value: float) -> SummaryBudget:
+        return cls(round(value, 3))
 
 
 @dataclass

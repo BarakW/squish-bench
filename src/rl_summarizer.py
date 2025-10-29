@@ -19,7 +19,7 @@ from transformers.tokenization_utils_base import BatchEncoding
 
 import wandb
 from data import format_context_for_training, get_attn_mask_from_tokens, get_context_for_evaluation, get_summary_from_generation
-from policy import Rollouts, SummaryBudgetChars
+from policy import Rollouts, SummaryBudget
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
@@ -48,6 +48,7 @@ class TrainingConfig(BaseSettings, cli_parse_args=True, cli_kebab_case=True):
     batch_micro_size: int = 1
     group_full_size: int = 32
     group_micro_size: int = 1
+    group_gen_size: int = 16
     policy_steps_per_group: int = 4
     learning_rate: float = 1e-5
     epsilon_low: float = 0.2
@@ -70,6 +71,10 @@ class TrainingConfig(BaseSettings, cli_parse_args=True, cli_kebab_case=True):
     @property
     def group_accum_steps(self) -> int:
         return self.group_full_size // self.group_micro_size
+
+    @property
+    def gen_steps(self) -> int:
+        return self.group_full_size // self.group_gen_size
 
 
 def setup_model_and_tokenizer(config: TrainingConfig) -> tuple[PreTrainedTokenizer, Qwen3ForCausalLM]:
@@ -111,7 +116,7 @@ def evaluate_summaries(
     document: str,
     summaries: list[str | None],
     /,
-    summary_budget: int,
+    summary_budget: SummaryBudget,
     micro_batch_size: int,
     is_training: bool,
 ) -> Tensor:
@@ -158,7 +163,8 @@ def evaluate_summaries(
     # Get the information saved by using the summary
     information_saved = document_loss - document_with_summary_loss
 
-    rewards_nonempty = information_saved.where(populated_summary_lens <= summary_budget, 0)
+    budget_chars = int(summary_budget * len(document))
+    rewards_nonempty = information_saved.where(populated_summary_lens <= budget_chars, 0)
     rewards_nonempty /= document_loss  # normalize reward by document information
 
     # Create a reward tensor for all summaries, setting (mean - (max - mean)) for empty ones
@@ -276,22 +282,32 @@ class StopOnSubsequence(LogitsProcessor):
         return scores_BTD
 
 
-def generate_outputs(model: Qwen3ForCausalLM, tokenizer: PreTrainedTokenizer, inputs: BatchEncoding, config: TrainingConfig) -> Tensor:
+def generate_outputs(model: Qwen3ForCausalLM, tokenizer: PreTrainedTokenizer, inputs_BT: BatchEncoding, config: TrainingConfig) -> Tensor:
     logits_processor = LogitsProcessorList(
         [StopOnSubsequence(tokenizer, stop_strings=["</summary>", tokenizer.eos_token], device=model.device)]
     )
+    generations_uBuGT: list[Tensor] = []
     with torch.inference_mode():
-        batch_completions_BT = model.generate(
-            do_sample=True,
-            temperature=1.0,
-            num_return_sequences=config.group_full_size,
-            logits_processor=logits_processor,
-            max_new_tokens=512,
-            pad_token_id=tokenizer.pad_token_id,
-            **inputs,  # type: ignore
-        )
+        for _ in range(config.gen_steps):
+            batch_completions_uBT = cast(
+                Tensor,
+                model.generate(
+                    do_sample=True,
+                    temperature=1.0,
+                    num_return_sequences=config.group_gen_size,
+                    logits_processor=logits_processor,
+                    max_new_tokens=512,
+                    pad_token_id=tokenizer.pad_token_id,
+                    **inputs_BT,  # type: ignore
+                ),
+            )
+            generations_uBuGT.append(batch_completions_uBT.reshape(config.batch_micro_size, config.group_gen_size, -1))
 
-    return cast(Tensor, batch_completions_BT.clone())  # clone the tensor so it can be saved in a backwards pass downstream
+    max_length = max([generation_uBuGT.shape[2] for generation_uBuGT in generations_uBuGT])
+    padded_generations_uBuGT = [F.pad(gen_uBuGT, (0, max_length - gen_uBuGT.shape[2])) for gen_uBuGT in generations_uBuGT]
+    batch_completions_uBT = torch.cat(padded_generations_uBuGT, dim=1).reshape(-1, max_length)
+
+    return batch_completions_uBT.clone()  # clone the tensor so it can be saved in a backwards pass downstream
 
 
 def get_policy_log_probs(
@@ -308,8 +324,8 @@ def get_policy_log_probs(
         input_ids = micro_batch_completions[:, :-1]
         target_ids = micro_batch_completions[:, 1:]
 
-        policy_log_probs_BT = get_model_log_probs(model, input_ids, target_ids, attn, forward_only)
-        microbatch_policy_log_probs.append(policy_log_probs_BT)
+        policy_log_probs_uBT = get_model_log_probs(model, input_ids, target_ids, attn, forward_only)
+        microbatch_policy_log_probs.append(policy_log_probs_uBT)
     return torch.cat(microbatch_policy_log_probs, dim=0).view(B, G, -1)
 
 
@@ -329,7 +345,7 @@ def move_optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.dev
 
 def main():
     """Main training function."""
-    SUMMARY_BUDGET_CHOICES = torch.tensor([budget.value for budget in SummaryBudgetChars], device=DEVICE)
+    SUMMARY_BUDGET_CHOICES = torch.tensor([budget.value for budget in SummaryBudget], device=DEVICE)
     CONFIG = CliApp.run(TrainingConfig)
 
     tokenizer, policy_model = setup_model_and_tokenizer(CONFIG)
@@ -363,10 +379,10 @@ def main():
                 end = (batch_accum_step + 1) * CONFIG.batch_micro_size
                 micro_batch = batch["text"][start:end]
 
-                B, G = CONFIG.batch_micro_size, CONFIG.group_full_size
+                uB, G = CONFIG.batch_micro_size, CONFIG.group_full_size
 
-                budget_choices_idx = torch.randint(len(SUMMARY_BUDGET_CHOICES), (B,))
-                summary_budgets_B = SUMMARY_BUDGET_CHOICES[budget_choices_idx]
+                budget_choices_idx = torch.randint(len(SUMMARY_BUDGET_CHOICES), (uB,))
+                summary_budgets_uB = SUMMARY_BUDGET_CHOICES[budget_choices_idx]
 
                 # TODO: handle document truncation without doing a tokenizer round trip
                 batch_accum_documents_tokens = tokenizer(
@@ -379,61 +395,61 @@ def main():
                 batch_accum_documents = tokenizer.batch_decode(batch_accum_documents_tokens.input_ids, skip_special_tokens=True)
                 batch_accum_contexts = [
                     cast(str, tokenizer.eos_token)
-                    + format_context_for_training(cast(str, doc), cast(int, budget.item()), is_base_model=True)
-                    for doc, budget in zip(batch_accum_documents, summary_budgets_B)
+                    + format_context_for_training(cast(str, doc), SummaryBudget.from_float(budget.item()), is_base_model=True)
+                    for doc, budget in zip(batch_accum_documents, summary_budgets_uB)
                 ]
                 batch_accum_tokens = tokenizer(batch_accum_contexts, padding=True, padding_side="left", return_tensors="pt").to(DEVICE)
 
-                input_ids_BT = batch_accum_tokens.input_ids
-                attn_mask_BT = batch_accum_tokens.attention_mask
+                input_ids_uBT = batch_accum_tokens.input_ids
+                attn_mask_uBT = batch_accum_tokens.attention_mask
 
-                batch_accum_completions_flat = generate_outputs(policy_model, tokenizer, batch_accum_tokens, CONFIG)
-                generations_accum = tokenizer.batch_decode(batch_accum_completions_flat)
-                batch_accum_completions_BGT = batch_accum_completions_flat.reshape(B, G, -1)
+                batch_accum_completions_uBT = generate_outputs(policy_model, tokenizer, batch_accum_tokens, CONFIG)
+                generations_accum = tokenizer.batch_decode(batch_accum_completions_uBT)
+                batch_accum_completions_uBGT = batch_accum_completions_uBT.reshape(uB, G, -1)
 
-                old_policy_log_probs_BGT = get_policy_log_probs(
-                    policy_model, tokenizer, batch_accum_completions_BGT, micro_batch_size=CONFIG.group_micro_size, forward_only=True
+                old_policy_log_probs_uBGT = get_policy_log_probs(
+                    policy_model, tokenizer, batch_accum_completions_uBGT, micro_batch_size=CONFIG.group_micro_size, forward_only=True
                 )
 
-                _, _, T = old_policy_log_probs_BGT.shape
-                prompt_lens_B = attn_mask_BT.sum(dim=1)
-                sequence_lens_BG = (batch_accum_completions_BGT != tokenizer.pad_token_id).sum(dim=2)
-                gen_lens_BG = sequence_lens_BG - prompt_lens_B[:, None]
+                _, _, T = old_policy_log_probs_uBGT.shape
+                prompt_lens_uB = attn_mask_uBT.sum(dim=1)
+                sequence_lens_uBG = (batch_accum_completions_uBGT != tokenizer.pad_token_id).sum(dim=2)
+                gen_lens_uBG = sequence_lens_uBG - prompt_lens_uB[:, None]
 
                 # Create generation mask
                 # Since batches are left padded, all generations start at the same position
-                start_idx = input_ids_BT.shape[1]
-                positions_BGT = torch.arange(T, device=policy_model.device).repeat(B, G, 1)
-                generation_mask_BGT = (positions_BGT > start_idx) & (positions_BGT <= (start_idx + gen_lens_BG)[:, :, None])
-                generation_mask_BGT = generation_mask_BGT.to(torch.int8)
+                start_idx = input_ids_uBT.shape[1]
+                positions_uBGT = torch.arange(T, device=policy_model.device).repeat(uB, G, 1)
+                generation_mask_uBGT = (positions_uBGT > start_idx) & (positions_uBGT <= (start_idx + gen_lens_uBG)[:, :, None])
+                generation_mask_uBGT = generation_mask_uBGT.to(torch.int8)
 
-                rollouts_slice_BGT = Rollouts(
-                    tokens_BGT=batch_accum_completions_BGT,
-                    generation_mask_BGT=generation_mask_BGT,
-                    old_policy_log_probs_BGT=old_policy_log_probs_BGT,
-                    summary_budgets_B=summary_budgets_B,
+                rollouts_slice_uBGT = Rollouts(
+                    tokens_BGT=batch_accum_completions_uBGT,
+                    generation_mask_BGT=generation_mask_uBGT,
+                    old_policy_log_probs_BGT=old_policy_log_probs_uBGT,
+                    summary_budgets_B=summary_budgets_uB,
                 )
-                rollouts_accum_list.append(rollouts_slice_BGT)
+                rollouts_accum_list.append(rollouts_slice_uBGT)
 
                 # group summaries by document
                 summaries = [get_summary_from_generation(text, is_base_model=True) for text in generations_accum]
                 logger.info("Generated summaries:")
                 for summary in summaries:
                     logger.info(f"\t{summary}")
-                summaries_BG = [summaries[i * G : (i + 1) * G] for i in range(len(batch_accum_documents))]
-                rewards_BG = [
+                summaries_uBG = [summaries[i * G : (i + 1) * G] for i in range(len(batch_accum_documents))]
+                rewards_uBG = [
                     evaluate_summaries(
                         policy_model,
                         tokenizer,
                         batch_accum_documents[i],
-                        summaries_BG[i],
-                        cast(int, summary_budgets_B[i].item()),
+                        summaries_uBG[i],
+                        SummaryBudget.from_float(summary_budgets_uB[i].item()),
                         micro_batch_size=CONFIG.group_micro_size,
                         is_training=False,
                     )
                     for i in range(len(batch_accum_documents))
                 ]
-                rewards_accum_list.append(rewards_BG)
+                rewards_accum_list.append(rewards_uBG)
 
             reward_mean = torch.cat([torch.cat(rewards) for rewards in rewards_accum_list], dim=0).mean()
 

@@ -20,7 +20,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 from client import client_config
 from data import format_context_for_training, get_summary_from_generation
 from persistent_kv_store import PersistentKVStore
-from policy import SummaryBudget, SummaryBudgetChars, SummaryBudgetRatio
+from policy import SummaryBudget
 from process_dataset import DATASET_PATH
 from rl_summarizer import evaluate_summaries
 
@@ -138,18 +138,13 @@ MODEL_SPECS: list[ModelSpec] = [
 def parse_summary_budget(summary_budget_input: str | SummaryBudget) -> SummaryBudget:
     if isinstance(summary_budget_input, SummaryBudget):
         return summary_budget_input
-    type_, value = summary_budget_input.split(".")
-    if type_ == "chars":
-        return SummaryBudgetChars[value]
-    elif type_ == "ratio":
-        return SummaryBudgetRatio[value]
-    raise ValueError(f"Invalid summary budget type: {type_}")
+    return SummaryBudget[summary_budget_input]
 
 
 class BenchmarkConfig(BaseSettings, cli_parse_args=True, cli_kebab_case=True):
     limit: int = Field(description="Maximum number of documents to process", default=8, gt=0)
     summary_budget: Annotated[SummaryBudget, BeforeValidator(parse_summary_budget)] = Field(
-        description="Summary budget", default=SummaryBudgetChars.LARGE
+        description="Summary budget", default=SummaryBudget.LARGE
     )
     samples_per_doc: int = Field(description="Number of samples to generate per document", default=1, gt=0)
     cache_dir: Path = Field(description="Directory to cache model outputs", default=Path("cache"))
@@ -232,10 +227,7 @@ async def generate_summary(
     if spec.reasoning is not None:
         extra_args["reasoning"] = {"effort": spec.reasoning}
 
-    if isinstance(summary_budget, SummaryBudgetChars):
-        budget_chars = summary_budget.value
-    else:
-        budget_chars = int(len(document.text) * summary_budget.value)
+    budget_chars = int(len(document.text) * summary_budget.value)
     prompt = format_context_for_training(document.text, budget_chars, is_base_model=False)
     backoff = 1.0
     for attempt in range(max_retries):
@@ -290,10 +282,7 @@ def docs_iter(config: BenchmarkConfig) -> Iterator[DocumentRecord]:
         document_text: str = elem["text"]  # type: ignore[reportArgumentType]
 
         # TODO: consolidate document length filtering into the dataset preprocessing
-        if isinstance(config.summary_budget, SummaryBudgetChars):
-            summary_chars = config.summary_budget
-        else:
-            summary_chars = len(document_text) * config.summary_budget
+        summary_chars = len(document_text) * config.summary_budget
         document_max_chars = MAX_CHARS - summary_chars - CONTEXT_EPS
         if len(document_text) > document_max_chars:
             continue
@@ -459,11 +448,7 @@ async def benchmark_models(config: BenchmarkConfig) -> None:
             if summary_store[cache_key] is not None:
                 continue
 
-            if isinstance(summary_budget, SummaryBudgetChars):
-                budget_chars = summary_budget.value
-            else:
-                budget_chars = int(len(doc.text) * summary_budget.value)
-
+            budget_chars = int(len(doc.text) * summary_budget.value)
             summary_store[cache_key] = SummaryRecord(
                 model_spec=TRUNCATED_DOC_SPEC,
                 document_id=doc.id,
@@ -498,11 +483,7 @@ async def benchmark_models(config: BenchmarkConfig) -> None:
         if not summary_records_for_doc:
             continue
 
-        if isinstance(summary_budget, SummaryBudgetChars):
-            budget_chars = summary_budget.value
-        else:
-            budget_chars = int(len(doc.text) * summary_budget.value)
-
+        budget_chars = int(len(doc.text) * summary_budget.value)
         summaries_for_doc: list[str | None] = []
         for rec, _, _ in summary_records_for_doc:
             if rec.summary and 1.5 * budget_chars > len(rec.summary) > budget_chars:
@@ -515,7 +496,7 @@ async def benchmark_models(config: BenchmarkConfig) -> None:
             tokenizer,
             doc.text,
             summaries_for_doc,
-            summary_budget=budget_chars,
+            summary_budget=summary_budget,
             micro_batch_size=REFERENCE_EVAL_MICRO_BATCH,
             is_training=False,
         )
