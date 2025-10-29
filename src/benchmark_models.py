@@ -197,14 +197,7 @@ def load_reference_model(model_name: str) -> tuple[PreTrainedTokenizer, PreTrain
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if device == "cuda":
-        dtype = torch.bfloat16
-    elif device == "mps":
-        dtype = torch.float16
-    else:
-        dtype = torch.float32
-
-    model_kwargs: dict[str, Any] = {"dtype": dtype, "trust_remote_code": True}
+    model_kwargs: dict[str, Any] = {"dtype": torch.bfloat16, "trust_remote_code": True}
     if device == "cuda":
         model_kwargs["device_map"] = "auto"
         model_kwargs["attn_implementation"] = "flash_attention_2"
