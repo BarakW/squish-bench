@@ -5,15 +5,17 @@ import hashlib
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
-from typing import Any, Iterator, Literal, cast
+from typing import Iterator, Literal, cast
 
 import httpx
 import matplotlib.pyplot as plt
 import torch
-from pydantic import BaseModel, BeforeValidator, Field
+from peft import PeftModel
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, CliApp
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationMixin, PreTrainedModel, PreTrainedTokenizer
 from typing_extensions import Annotated
 
 from client import client_config
@@ -33,105 +35,156 @@ CONTEXT_EPS = 500
 MODEL_EVAL_MIN_PASS_RATE = 0.8
 
 
-@dataclass(frozen=True)
-class ModelSpec:
+class LocalModel(BaseModel):
+    id: str
+    type: Literal["local"] = "local"
+
+
+class RemoteModel(BaseModel):
+    id: str
+    type: Literal["remote"] = "remote"
+
+
+class ModelSpec(BaseModel):
     display_name: str
-    model_id: str
+    model_id: RemoteModel | LocalModel = Field(discriminator="type")
     reasoning: Literal["minimal", "low", "medium", "high"] | None = None
     max_output_tokens: int = 2048
     unique_key: str = ""
 
     @property
     def spec_id(self) -> str:
-        return f"{self.model_id}::{self.unique_key}" if self.unique_key else self.model_id
+        return f"{self.model_id.id}::{self.unique_key}" if self.unique_key else self.model_id.id
 
     @property
     def path_safe_spec_id(self) -> str:
         return self.spec_id.replace("/", "__").replace(":", "_")
 
+    # TODO: remove this parser, it's only to handle non-discriminated model IDs in the cache to save money
+    @model_validator(mode="before")
+    @classmethod
+    def validate_model_id(cls, data: dict):
+        model_id = data.get("model_id")
+        if isinstance(model_id, str):
+            data = {**data, "model_id": {"id": model_id, "type": "remote"}}
+        return data
+
 
 MODEL_SPECS: list[ModelSpec] = [
     # OpenAI
-    ModelSpec("GPT-5 (Reasoning)", model_id="openai/gpt-5", unique_key="reasoning", reasoning="medium"),
-    ModelSpec("GPT-5 (Instruct)", model_id="openai/gpt-5", unique_key="instruct", reasoning="minimal"),
-    ModelSpec("GPT-5-mini (Reasoning)", model_id="openai/gpt-5-mini", unique_key="reasoning", reasoning="medium"),
-    ModelSpec("GPT-5-mini (Instruct)", model_id="openai/gpt-5-mini", unique_key="instruct", reasoning="minimal"),
-    ModelSpec("GPT-5-nano (Reasoning)", model_id="openai/gpt-5-nano", unique_key="reasoning", reasoning="medium"),
-    ModelSpec("GPT-5-nano (Instruct)", model_id="openai/gpt-5-nano", unique_key="instruct", reasoning="minimal"),
-    ModelSpec("GPT-4.1 (Instruct)", model_id="openai/gpt-4.1"),
-    ModelSpec("GPT-4.1 Mini (Instruct)", model_id="openai/gpt-4.1-mini"),
-    ModelSpec("GPT-4.1 Nano (Instruct)", model_id="openai/gpt-4.1-nano"),
-    ModelSpec("GPT-3.5 Turbo (Instruct)", model_id="openai/gpt-3.5-turbo"),
+    ModelSpec(display_name="GPT-5 (Reasoning)", model_id=RemoteModel(id="openai/gpt-5"), unique_key="reasoning", reasoning="medium"),
+    ModelSpec(display_name="GPT-5 (Instruct)", model_id=RemoteModel(id="openai/gpt-5"), unique_key="instruct", reasoning="minimal"),
+    ModelSpec(
+        display_name="GPT-5-mini (Reasoning)", model_id=RemoteModel(id="openai/gpt-5-mini"), unique_key="reasoning", reasoning="medium"
+    ),
+    ModelSpec(
+        display_name="GPT-5-mini (Instruct)", model_id=RemoteModel(id="openai/gpt-5-mini"), unique_key="instruct", reasoning="minimal"
+    ),
+    ModelSpec(
+        display_name="GPT-5-nano (Reasoning)", model_id=RemoteModel(id="openai/gpt-5-nano"), unique_key="reasoning", reasoning="medium"
+    ),
+    ModelSpec(
+        display_name="GPT-5-nano (Instruct)", model_id=RemoteModel(id="openai/gpt-5-nano"), unique_key="instruct", reasoning="minimal"
+    ),
+    ModelSpec(display_name="GPT-4.1 (Instruct)", model_id=RemoteModel(id="openai/gpt-4.1")),
+    ModelSpec(display_name="GPT-4.1 Mini (Instruct)", model_id=RemoteModel(id="openai/gpt-4.1-mini")),
+    ModelSpec(display_name="GPT-4.1 Nano (Instruct)", model_id=RemoteModel(id="openai/gpt-4.1-nano")),
+    ModelSpec(display_name="GPT-3.5 Turbo (Instruct)", model_id=RemoteModel(id="openai/gpt-3.5-turbo")),
     # Anthropic
-    ModelSpec("Claude 4.5 Sonnet (Reasoning)", model_id="anthropic/claude-sonnet-4.5", unique_key="reasoning", reasoning="medium"),
-    ModelSpec("Claude 4.5 Sonnet (Instruct)", model_id="anthropic/claude-sonnet-4.5", unique_key="instruct"),
-    ModelSpec("Claude 4.5 Haiku (Reasoning)", model_id="anthropic/claude-haiku-4.5", unique_key="reasoning", reasoning="medium"),
-    ModelSpec("Claude 4.5 Haiku (Instruct)", model_id="anthropic/claude-haiku-4.5", unique_key="instruct"),
-    ModelSpec("Claude 4 Sonnet (Reasoning)", model_id="anthropic/claude-sonnet-4", unique_key="reasoning", reasoning="medium"),
-    ModelSpec("Claude 4 Sonnet (Instruct)", model_id="anthropic/claude-sonnet-4", unique_key="instruct"),
-    ModelSpec("Claude 3.7 Sonnet (Reasoning)", model_id="anthropic/claude-3-7-sonnet:thinking"),
-    ModelSpec("Claude 3.7 Sonnet (Instruct)", model_id="anthropic/claude-3-7-sonnet"),
-    ModelSpec("Claude 3 Haiku (Instruct)", model_id="anthropic/claude-3-haiku"),
+    ModelSpec(
+        display_name="Claude 4.5 Sonnet (Reasoning)",
+        model_id=RemoteModel(id="anthropic/claude-sonnet-4.5"),
+        unique_key="reasoning",
+        reasoning="medium",
+    ),
+    ModelSpec(display_name="Claude 4.5 Sonnet (Instruct)", model_id=RemoteModel(id="anthropic/claude-sonnet-4.5"), unique_key="instruct"),
+    ModelSpec(
+        display_name="Claude 4.5 Haiku (Reasoning)",
+        model_id=RemoteModel(id="anthropic/claude-haiku-4.5"),
+        unique_key="reasoning",
+        reasoning="medium",
+    ),
+    ModelSpec(display_name="Claude 4.5 Haiku (Instruct)", model_id=RemoteModel(id="anthropic/claude-haiku-4.5"), unique_key="instruct"),
+    ModelSpec(
+        display_name="Claude 4 Sonnet (Reasoning)",
+        model_id=RemoteModel(id="anthropic/claude-sonnet-4"),
+        unique_key="reasoning",
+        reasoning="medium",
+    ),
+    ModelSpec(display_name="Claude 4 Sonnet (Instruct)", model_id=RemoteModel(id="anthropic/claude-sonnet-4"), unique_key="instruct"),
+    ModelSpec(
+        display_name="Claude 3.7 Sonnet (Reasoning)",
+        model_id=RemoteModel(id="anthropic/claude-3-7-sonnet"),
+        unique_key="reasoning",
+        reasoning="medium",
+    ),
+    ModelSpec(display_name="Claude 3.7 Sonnet (Instruct)", model_id=RemoteModel(id="anthropic/claude-3-7-sonnet"), unique_key="instruct"),
+    ModelSpec(display_name="Claude 3 Haiku (Instruct)", model_id=RemoteModel(id="anthropic/claude-3-haiku"), unique_key="instruct"),
     # Gemini
-    ModelSpec("Gemini 2.5 Pro (Reasoning)", "google/gemini-2.5-pro", reasoning="medium"),
+    ModelSpec(display_name="Gemini 2.5 Pro (Reasoning)", model_id=RemoteModel(id="google/gemini-2.5-pro"), reasoning="medium"),
     ModelSpec(
-        "Gemini 2.5 Flash (Reasoning)",
-        model_id="google/gemini-2.5-flash",
+        display_name="Gemini 2.5 Flash (Reasoning)",
+        model_id=RemoteModel(id="google/gemini-2.5-flash"),
         reasoning="medium",
         unique_key="reasoning",
     ),
     ModelSpec(
-        "Gemini 2.5 Flash (Instruct)",
-        model_id="google/gemini-2.5-flash",
+        display_name="Gemini 2.5 Flash (Instruct)",
+        model_id=RemoteModel(id="google/gemini-2.5-flash"),
         unique_key="instruct",
     ),
     ModelSpec(
-        "Gemini 2.5 Flash Lite (Reasoning)",
-        model_id="google/gemini-2.5-flash-lite",
+        display_name="Gemini 2.5 Flash Lite (Reasoning)",
+        model_id=RemoteModel(id="google/gemini-2.5-flash-lite"),
         reasoning="medium",
         unique_key="reasoning",
     ),
     ModelSpec(
-        "Gemini 2.5 Flash Lite (Instruct)",
-        model_id="google/gemini-2.5-flash-lite",
+        display_name="Gemini 2.5 Flash Lite (Instruct)",
+        model_id=RemoteModel(id="google/gemini-2.5-flash-lite"),
         unique_key="instruct",
     ),
-    ModelSpec("Gemini 2.0 Flash (Instruct)", model_id="google/gemini-2.0-flash-001"),
+    ModelSpec(display_name="Gemini 2.0 Flash (Instruct)", model_id=RemoteModel(id="google/gemini-2.0-flash-001")),
     # Deepseek
-    ModelSpec("DeepSeek R1 (Reasoning)", model_id="deepseek/deepseek-r1"),
+    ModelSpec(display_name="DeepSeek R1 (Reasoning)", model_id=RemoteModel(id="deepseek/deepseek-r1")),
     ModelSpec(
-        "DeepSeek V3.1 (Reasoning)",
-        model_id="deepseek/deepseek-chat-v3.1",
+        display_name="DeepSeek V3.1 (Reasoning)",
+        model_id=RemoteModel(id="deepseek/deepseek-chat-v3.1"),
         reasoning="medium",
         unique_key="reasoning",
     ),
     ModelSpec(
-        "DeepSeek V3.1 (Instruct)",
-        model_id="deepseek/deepseek-chat-v3.1",
+        display_name="DeepSeek V3.1 (Instruct)",
+        model_id=RemoteModel(id="deepseek/deepseek-chat-v3.1"),
         reasoning="medium",
         unique_key="instruct",
     ),
     # Qwen
-    ModelSpec("Qwen3 235B A22B (Reasoning)", model_id="qwen/qwen3-235b-a22b-thinking-2507"),
-    ModelSpec("Qwen3 235B A22B (Instruct)", model_id="qwen/qwen3-235b-a22b-2507"),
-    ModelSpec("Qwen3 30B A3B (Reasoning)", model_id="qwen/qwen3-30b-a3b-thinking-2507"),
-    ModelSpec("Qwen3 30B A3B (Instruct)", model_id="qwen/qwen3-30b-a3b-instruct-2507"),
+    ModelSpec(display_name="Qwen3 235B A22B (Reasoning)", model_id=RemoteModel(id="qwen/qwen3-235b-a22b-thinking-2507")),
+    ModelSpec(display_name="Qwen3 235B A22B (Instruct)", model_id=RemoteModel(id="qwen/qwen3-235b-a22b-2507")),
+    ModelSpec(display_name="Qwen3 30B A3B (Reasoning)", model_id=RemoteModel(id="qwen/qwen3-30b-a3b-thinking-2507")),
+    ModelSpec(display_name="Qwen3 30B A3B (Instruct)", model_id=RemoteModel(id="qwen/qwen3-30b-a3b-instruct-2507")),
     # GLM
-    ModelSpec("GLM-4.6 (Reasoning)", model_id="z-ai/glm-4.6", reasoning="medium"),
-    ModelSpec("GLM-4 32B (Instruct)", model_id="z-ai/glm-4-32b"),
+    ModelSpec(display_name="GLM-4.6 (Reasoning)", model_id=RemoteModel(id="z-ai/glm-4.6"), reasoning="medium"),
+    ModelSpec(display_name="GLM-4 32B (Instruct)", model_id=RemoteModel(id="z-ai/glm-4-32b"), unique_key="instruct"),
     # Kimi
-    ModelSpec("Kimi K2 (Instruct)", model_id="moonshotai/kimi-k2-0905"),
+    ModelSpec(display_name="Kimi K2 (Instruct)", model_id=RemoteModel(id="moonshotai/kimi-k2-0905")),
     # LLaMA
-    ModelSpec("Llama 3.3 70B Instruct", model_id="meta-llama/llama-3.3-70b-instruct"),
-    ModelSpec("Llama 3.1 8B Instruct", model_id="meta-llama/llama-3.1-8b-instruct"),
+    ModelSpec(display_name="Llama 3.3 70B Instruct", model_id=RemoteModel(id="meta-llama/llama-3.3-70b-instruct")),
+    ModelSpec(display_name="Llama 3.1 8B Instruct", model_id=RemoteModel(id="meta-llama/llama-3.1-8b-instruct")),
     # Grok
-    ModelSpec("Grok 4 (Reasoning)", model_id="x-ai/grok-4"),
-    ModelSpec("Grok 4 Fast (Instruct)", model_id="x-ai/grok-4-fast"),
-    ModelSpec("Grok 3 Mini (Instruct)", model_id="x-ai/grok-3-mini"),
+    ModelSpec(display_name="Grok 4 (Reasoning)", model_id=RemoteModel(id="x-ai/grok-4")),
+    ModelSpec(display_name="Grok 4 Fast (Instruct)", model_id=RemoteModel(id="x-ai/grok-4-fast")),
+    ModelSpec(display_name="Grok 3 Mini (Instruct)", model_id=RemoteModel(id="x-ai/grok-3-mini")),
     # Mistral
-    ModelSpec("Mistral Magistral Medium 2506 (Reasoning)", model_id="mistralai/magistral-medium-2506"),
-    ModelSpec("Mistral Medium 3.1 (Instruct)", model_id="mistralai/mistral-medium-3.1"),
-    ModelSpec("Mistral Small 3.2 24B (Instruct)", model_id="mistralai/mistral-small-3.2-24b-instruct"),
+    ModelSpec(display_name="Mistral Magistral Medium 2506 (Reasoning)", model_id=RemoteModel(id="mistralai/magistral-medium-2506")),
+    ModelSpec(display_name="Mistral Medium 3.1 (Instruct)", model_id=RemoteModel(id="mistralai/mistral-medium-3.1")),
+    ModelSpec(display_name="Mistral Small 3.2 24B (Instruct)", model_id=RemoteModel(id="mistralai/mistral-small-3.2-24b-instruct")),
+    # Local LoRA
+    ModelSpec(
+        display_name="Custom RL Qwen3 1.7B Base (Instruct)",
+        model_id=LocalModel(id="qwen3_1.7B_base_rl"),
+    ),
 ]
 
 
@@ -141,7 +194,7 @@ def parse_summary_budget(summary_budget_input: str | SummaryBudget) -> SummaryBu
     return SummaryBudget[summary_budget_input]
 
 
-class BenchmarkConfig(BaseSettings, cli_parse_args=True, cli_kebab_case=True):
+class BenchmarkConfig(BaseSettings, cli_parse_args=True, cli_kebab_case=True, frozen=True):
     limit: int = Field(description="Maximum number of documents to process", default=8, gt=0)
     summary_budget: Annotated[SummaryBudget, BeforeValidator(parse_summary_budget)] = Field(
         description="Summary budget", default=SummaryBudget.LARGE
@@ -191,28 +244,68 @@ def detect_device() -> str:
     return "cpu"
 
 
-def load_reference_model(model_name: str) -> tuple[PreTrainedTokenizer, PreTrainedModel]:
-    device = detect_device()
-    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", trust_remote_code=True)
+# One day python type hints will include type intersections and I can delete this
+class BaseModelWithGenerate(PreTrainedModel, GenerationMixin):
+    pass
+
+
+def load_model(config: BenchmarkConfig, lora_model_name: str | None = None) -> tuple[PreTrainedTokenizer, BaseModelWithGenerate]:
+    tokenizer = AutoTokenizer.from_pretrained(config.reference_model, padding_side="left", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_kwargs: dict[str, Any] = {}
-    if device == "cuda":
-        model_kwargs["device_map"] = "auto"
-        model_kwargs["attn_implementation"] = "flash_attention_2"
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.reference_model,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="flash_attention_2",
+        trust_remote_code=True,
+    )
 
-    base_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, trust_remote_code=True, **model_kwargs)
-    if device != "cuda":
-        base_model.to(device)
-    base_model.eval()
-    return tokenizer, base_model
+    if lora_model_name is not None:
+        print(f"Loading trained model from {lora_model_name}")
+        model = PeftModel.from_pretrained(base_model, f"models/{lora_model_name}")
+    else:
+        model = base_model
+    model.eval()
+    model.forward = torch.compile(model.forward, dynamic=True)
+    return tokenizer, cast(BaseModelWithGenerate, base_model)
 
 
-async def generate_summary(
+@cache
+def get_local_model(config: BenchmarkConfig, lora_model_name: str | None = None) -> tuple[PreTrainedTokenizer, BaseModelWithGenerate]:
+    return load_model(config, lora_model_name)
+
+
+# TODO: gather input jobs into batches before inference, to take more advantage of compute capacity
+async def generate_local_summary(spec: ModelSpec, document: DocumentRecord, config: BenchmarkConfig, sample_index: int) -> SummaryRecord:
+    tokenizer, model = get_local_model(config, spec.model_id.id)
+    prompt = format_context_for_training(document.text, config.summary_budget, is_base_model=True)
+
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, padding_side="left", truncation=True)
+    inputs = inputs.to(model.device)
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,  # type: ignore
+            do_sample=True,
+            temperature=1.0,
+            top_p=1.0,
+            max_new_tokens=512,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    prompt_and_generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    generated_text = "<summary>" + prompt_and_generated_text[len(prompt) :]
+    summary = get_summary_from_generation(generated_text, is_base_model=False)
+
+    return SummaryRecord(model_spec=spec, document_id=document.id, summary=summary, sample_index=sample_index, raw_response=generated_text)
+
+
+async def generate_remote_summary(
     spec: ModelSpec,
     document: DocumentRecord,
-    summary_budget: SummaryBudget,
+    config: BenchmarkConfig,
     max_retries: int,
     sample_index: int,
 ) -> SummaryRecord:
@@ -220,7 +313,7 @@ async def generate_summary(
     if spec.reasoning is not None:
         extra_args["reasoning"] = {"effort": spec.reasoning}
 
-    prompt = format_context_for_training(document.text, summary_budget, is_base_model=False)
+    prompt = format_context_for_training(document.text, config.summary_budget, is_base_model=False)
     backoff = 1.0
     for attempt in range(max_retries):
         try:
@@ -229,7 +322,7 @@ async def generate_summary(
                     url=f"{client_config.base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {client_config.openrouter_key}"},
                     json={
-                        "model": spec.model_id,
+                        "model": spec.model_id.id,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 1.0,
                         "top_p": 1.0,
@@ -354,6 +447,7 @@ def aggregate_results(config: BenchmarkConfig) -> None:
             )
 
     # Plot results
+    spec_id_to_spec = {spec.spec_id: spec for spec in MODEL_SPECS}
     plot_spec_ids = [
         spec_id for spec_id in spec_ids_sorted_by_reward if spec_id != TRUNCATED_DOC_SPEC.spec_id and spec_id in spec_ids_at_high_coverage
     ]
@@ -366,7 +460,10 @@ def aggregate_results(config: BenchmarkConfig) -> None:
 
     height = 0.3 * len(plot_spec_ids)
     fig, ax = plt.subplots(figsize=(10, height))
-    bars = ax.barh(plot_labels, plot_rewards, color="#4c78a8")
+
+    # Highlight the custom RL'd model in green
+    bar_colors = ["#2ca02c" if spec_id_to_spec[spec_id].model_id.type == "local" else "#4c78a8" for spec_id in plot_spec_ids]
+    bars = ax.barh(plot_labels, plot_rewards, color=bar_colors)
     ax.margins(x=0.1, y=0.01)
     ax.invert_yaxis()  # best model appears at the top
     ax.set_xlabel("Mean reward")
@@ -404,13 +501,20 @@ async def summarization_worker(
             job_queue.task_done()
             continue
 
-        result = await generate_summary(spec, document, config.summary_budget, config.max_retries, sample_index)
-        store[cache_key] = result
+        try:
+            match spec.model_id:
+                case LocalModel():
+                    result = await generate_local_summary(spec, document, config, sample_index)
+                case RemoteModel():
+                    result = await generate_remote_summary(spec, document, config, config.max_retries, sample_index)
+            store[cache_key] = result
+        except Exception as e:
+            raise e
+        finally:
+            job_queue.task_done()
 
-        job_queue.task_done()
 
-
-TRUNCATED_DOC_SPEC = ModelSpec("Truncated Document Baseline", "baseline/truncated-document")
+TRUNCATED_DOC_SPEC = ModelSpec(display_name="Truncated Document Baseline", model_id=LocalModel(id="baseline/truncated-document"))
 
 
 async def benchmark_models(config: BenchmarkConfig) -> None:
@@ -419,7 +523,7 @@ async def benchmark_models(config: BenchmarkConfig) -> None:
     print(f"Preparing to evaluate up to {config.limit} documents.")
     print(f"Benchmarking {len(MODEL_SPECS)} model(s) with summary budget {summary_budget}.")
 
-    tokenizer, reference_model = load_reference_model(config.reference_model)
+    tokenizer, reference_model = load_model(config)
 
     # Key structure: (spec_id, summary_budget, doc_id, sample_index)
     summary_store = PersistentKVStore(SummaryRecord, config.cache_dir / "summary")
