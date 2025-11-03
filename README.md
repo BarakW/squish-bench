@@ -20,6 +20,8 @@ In addition to the benchmarking code, there is also a script included to RL a sm
 The most relevant previous work is in [Shannon Score (2021)](https://arxiv.org/pdf/2103.10918). The primary difference between SQUISH and Shannon Score is that SQUISH includes a requirement for summaries to be smaller than the original document, which allows for RL to improve summary quality without encouraging the trivial case of the document being its own summary.
 
 ## Results
+By training a small **base** model (without built-in chat capabilities) with a policy gradient approach on an RTX 3090 over 2 days, we can reach SOTA performance on the SQUISH benchmark. The custom model results are highlighted in the charts below in green.
+
 You can run this benchmark at multiple different ratios of summary size, which is the primary parameter of interest in the SQUISH benchmark. The N in `@N%` refers to the percentage of the original document's length that the summary is constrained to.
 
 ### SQUISH@5%
@@ -44,6 +46,9 @@ Add OpenRouter credentials in a `.env` file at the root of the repo (it's in `.g
 
 ### 4. Run RL script
 `uv run src/rl_summarizer.py`
+
+The smallest amount of VRAM tested for training was 24GB, which already takes advantage of VRAM saving techniques such as gradient checkpointing, LoRA, gradient accumulation, and `torch.compile` (which substantially saves VRAM at the vocab sized logit projection step). Training on a lesser amount of VRAM is not supported.
+
 ## FAQ
 #### Why characters and not tokens?
 3 different content size metrics were considered for this benchmark:
@@ -52,15 +57,19 @@ Add OpenRouter credentials in a `.env` file at the root of the repo (it's in `.g
 - Information
 
 Information and tokens are both valid ways of measuring the "size" of a summary, but is much harder to control for as a generation constraint across different models. For those looking to actually use this benchmark as an internal metric (and not compare to other model families), these alternative summary measures are still valuable. Tokens in particular has a great advantage of minimizing compute and KV-cache within a model family.
+
 #### Why relative summary length?
 Although it is desirable to define a fixed summary size in many applications (such as placement in UI elements like notifications), using a relative length for benchmarking minimizes bias in the value metric due to document length.
 
 ## Future work
 #### Model ensemble
 Currently only Qwen3-1.7B-base is being used as a reference model. However, it would be preferable to include a few different model families (and perhaps different model sizes), introduce variance to the biases inherent in pretraining data mixes.
+
 #### Multiple languages
 Currently the data corpus is only in English. It would be preferable to include other languages.
+
 #### More document topics
 Currently the data corpus only includes news-like data. It would be preferable to include document like: essays, transcripts, speeches, etc... Especially long form text.
+
 #### Better handling of long contexts
 Current models have demonstrated issues with in-context learning as context length increases substantially. As in-context learning is a primary measured factor of this benchmark, it would be preferable to update the reference model when such capabilities improve.
